@@ -9,7 +9,7 @@ same permission is granted on several resources.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 CONFIRM = "confirm"
@@ -67,6 +67,7 @@ def build_campaign(grants: list[dict[str, Any]], policy: dict[str, Any], now: An
     return {
         "campaign_id": campaign_id,
         "created_at": now,
+        "deadline": deadline,
         "grants": copied_grants,
         "decisions": [],
         "approvers": list(policy.get("approvers", [])),
@@ -91,6 +92,7 @@ def decide(
     """Record one reviewer decision for a grant."""
 
     action = _normalize_decision(decision)
+    _require_reviewer(grant, reviewer, policy)
     grant_id = grant.get("grant_id")
     return {
         "grant_id": grant_id,
@@ -109,13 +111,21 @@ def decide(
     }
 
 
+def _as_datetime(value: Any) -> Any:
+    """Parse ISO formatted deadline strings; leave datetime values untouched."""
+
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    return value
+
+
 def is_expired(campaign: dict[str, Any], now: Any) -> bool:
     """Return whether a campaign has reached or passed its deadline."""
 
     deadline = campaign.get("deadline")
     if deadline is None:
         return False
-    return now > deadline
+    return _as_datetime(now) >= _as_datetime(deadline)
 
 
 def finalize(campaign: dict[str, Any], now: Any) -> dict[str, Any]:
@@ -146,8 +156,9 @@ def finalize(campaign: dict[str, Any], now: Any) -> dict[str, Any]:
             _add_unique(revoked, grant_id)
             outcome = "revoked"
         elif expired:
-            _add_unique(confirmed, grant_id)
-            outcome = "confirmed"
+            # Overdue and never confirmed: revoke by default.
+            _add_unique(revoked, grant_id)
+            outcome = "revoked"
         else:
             _add_unique(pending, grant_id)
             outcome = "pending"
@@ -164,37 +175,21 @@ def finalize(campaign: dict[str, Any], now: Any) -> dict[str, Any]:
             }
         )
 
-    if expired:
-        for settled_id in list(confirmed):
-            _add_unique(revoked, settled_id)
-
     return {
         "campaign_id": campaign_id,
         "confirmed": confirmed,
         "revoked": revoked,
         "pending": pending,
         "expired": expired,
-        "audit": [],
+        "audit": audit,
     }
 
 
 def revoke_all(grants: list[dict[str, Any]], grant_id: Any) -> dict[str, Any]:
     """Remove every stored instance of one permission."""
 
-    target = None
-    for grant in grants:
-        if grant.get("grant_id") == grant_id:
-            target = grant
-            break
-    if target is None:
-        return {
-            "grant_id": grant_id,
-            "revoked": [],
-            "kept": [deepcopy(grant) for grant in grants],
-            "count": 0,
-        }
-    revoked = [deepcopy(target)]
-    kept = [deepcopy(grant) for grant in grants if grant is not target]
+    revoked = [deepcopy(grant) for grant in grants if grant.get("grant_id") == grant_id]
+    kept = [deepcopy(grant) for grant in grants if grant.get("grant_id") != grant_id]
     return {
         "grant_id": grant_id,
         "revoked": revoked,
@@ -204,17 +199,17 @@ def revoke_all(grants: list[dict[str, Any]], grant_id: Any) -> dict[str, Any]:
 
 
 def dedupe_decisions(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep only the last decision for every grant id."""
+    """Keep only the last decision for every grant id.
 
-    ordered: list[Any] = []
-    seen: set[Any] = set()
+    The first-seen position of each grant id is preserved; later decisions
+    replace earlier ones so that reprocessing a batch cannot apply a stale
+    duplicate.
+    """
+
+    latest: dict[Any, dict[str, Any]] = {}
     for decision in decisions:
-        grant_id = decision.get("grant_id")
-        if grant_id in seen:
-            continue
-        seen.add(grant_id)
-        ordered.append(deepcopy(decision))
-    return ordered
+        latest[decision.get("grant_id")] = decision
+    return [deepcopy(decision) for decision in latest.values()]
 
 
 def validate_campaign(campaign: dict[str, Any]) -> list[str]:
@@ -243,6 +238,11 @@ def validate_campaign(campaign: dict[str, Any]) -> list[str]:
         if not reviewer:
             issues.append(f"missing reviewer for {grant_id}")
             continue
+        if reviewer != owners.get(grant_id) and reviewer not in approvers:
+            issues.append(
+                f"unauthorized reviewer {reviewer} for {grant_id}: "
+                "reviewer is not the owner or an authorized superior"
+            )
     return issues
 
 
@@ -251,11 +251,10 @@ def recert_batch(campaigns: list[dict[str, Any]], now: Any) -> dict[str, Any]:
 
     results: dict[Any, dict[str, Any]] = {}
     audit: list[dict[str, Any]] = []
-    shared_decisions: list[dict[str, Any]] = []
     for campaign in campaigns:
-        shared_decisions.extend(deepcopy(campaign.get("decisions", [])))
+        # Each campaign gets its own isolated working copy; decisions from one
+        # campaign must never leak into another campaign's settlement.
         working = deepcopy(campaign)
-        working["decisions"] = shared_decisions
         result = finalize(working, now)
         results[campaign.get("campaign_id")] = result
         audit.extend(result.get("audit", []))
